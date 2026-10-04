@@ -13,11 +13,15 @@ const PROFILE: Record<Mode, string> = {
 export interface GeocodeHit extends LatLon {
   label: string;
   confidence: number | null;
+  /** false when the geocoder only matched an area (city, county, neighbourhood), not the address itself */
+  precise: boolean;
 }
 
 export interface GeocodeResult {
   results: GeocodeHit[];
   ambiguous: boolean;
+  /** false when no result pinpoints the address; the UI must make the user confirm an approximate match */
+  precise: boolean;
 }
 
 const ORS = 'https://api.openrouteservice.org';
@@ -31,8 +35,10 @@ function checkOrsStatus(res: Response) {
 
 interface PeliasFeature {
   geometry: { coordinates: [number, number] };
-  properties: { label?: string; confidence?: number };
+  properties: { label?: string; confidence?: number; layer?: string; match_type?: string };
 }
+
+const PELIAS_PRECISE_LAYERS = new Set(['address', 'venue', 'street']);
 
 export function parsePelias(json: { features?: PeliasFeature[] }): GeocodeHit[] {
   return (json.features ?? [])
@@ -42,6 +48,9 @@ export function parsePelias(json: { features?: PeliasFeature[] }): GeocodeHit[] 
       lon: f.geometry.coordinates[0],
       label: f.properties.label as string,
       confidence: typeof f.properties.confidence === 'number' ? f.properties.confidence : null,
+      // Pelias answers with a "fallback" centroid of the city/county when it can't match the whole query,
+      // which is wrong for an address; an exact match on a city ("Katy, TX") is a legitimate answer.
+      precise: f.properties.match_type ? f.properties.match_type !== 'fallback' : PELIAS_PRECISE_LAYERS.has(f.properties.layer ?? ''),
     }));
 }
 
@@ -49,6 +58,8 @@ interface PhotonFeature {
   geometry: { coordinates: [number, number] };
   properties: Record<string, string | undefined>;
 }
+
+const PHOTON_AREA_TYPES = new Set(['city', 'county', 'state', 'country', 'district', 'locality', 'region']);
 
 export function parsePhoton(json: { features?: PhotonFeature[] }): GeocodeHit[] {
   return (json.features ?? [])
@@ -59,7 +70,13 @@ export function parsePhoton(json: { features?: PhotonFeature[] }): GeocodeHit[] 
       const label = [p.name && p.name !== p.street ? p.name : undefined, street || undefined, p.city, p.state, p.country]
         .filter(Boolean)
         .join(', ');
-      return { lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], label, confidence: null };
+      return {
+        lat: f.geometry.coordinates[1],
+        lon: f.geometry.coordinates[0],
+        label,
+        confidence: null,
+        precise: !PHOTON_AREA_TYPES.has(p.type ?? ''),
+      };
     })
     .filter((h) => h.label);
 }
@@ -87,6 +104,32 @@ async function geocodeOrs(text: string, key: string, f: Fetch): Promise<GeocodeH
   return parsePelias(await res.json());
 }
 
+interface CensusJson {
+  result?: { addressMatches?: { matchedAddress: string; coordinates: { x: number; y: number } }[] };
+}
+
+export function parseCensus(json: CensusJson): GeocodeHit[] {
+  return (json.result?.addressMatches ?? []).map((m) => ({
+    lat: m.coordinates.y,
+    lon: m.coordinates.x,
+    label: m.matchedAddress
+      .toLowerCase()
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+      .replace(/, ([a-z]{2}), /i, (_, st: string) => `, ${st.toUpperCase()} `),
+    confidence: null,
+    precise: true,
+  }));
+}
+
+async function geocodeCensus(text: string, f: Fetch): Promise<GeocodeHit[]> {
+  const url =
+    'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=' +
+    encodeURIComponent(text);
+  const res = await f(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8_000) });
+  if (!res.ok) throw new AppError('upstream', `Census geocoder error (${res.status}).`);
+  return parseCensus(await res.json());
+}
+
 async function geocodePhoton(text: string, f: Fetch): Promise<GeocodeHit[]> {
   const url = `https://photon.komoot.io/api/?limit=3&q=${encodeURIComponent(text)}`;
   const res = await f(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10_000) });
@@ -94,19 +137,54 @@ async function geocodePhoton(text: string, f: Fetch): Promise<GeocodeHit[]> {
   return parsePhoton(await res.json());
 }
 
+/** "2946 Granite Vale Rd, Houston, TX": a number followed by a street name. */
+export function looksLikeStreetAddress(text: string): boolean {
+  return /^\s*\d+[A-Za-z]?\s+\S+/.test(text);
+}
+
+function dedupe(hits: GeocodeHit[]): GeocodeHit[] {
+  const out: GeocodeHit[] = [];
+  for (const h of hits) if (!out.some((o) => haversineKm(o, h) < 0.15)) out.push(h);
+  return out;
+}
+
+/**
+ * Order matters: the US Census geocoder is authoritative for US street addresses (and free, keyless),
+ * OpenRouteService covers places and the world, Photon is the last resort. A source is only
+ * consulted further down the list if nothing before it pinpointed the address.
+ */
 export async function geocode(text: string, key: string | undefined, f: Fetch = fetch): Promise<GeocodeResult> {
-  let hits: GeocodeHit[] = [];
-  if (key) {
+  const hits: GeocodeHit[] = [];
+  const havePrecise = () => hits.some((h) => h.precise);
+
+  if (looksLikeStreetAddress(text)) {
     try {
-      hits = await geocodeOrs(text, key, f);
+      hits.push(...(await geocodeCensus(text, f)));
+    } catch {
+      /* Census is best-effort; carry on */
+    }
+  }
+  if (!havePrecise() && key) {
+    try {
+      hits.push(...(await geocodeOrs(text, key, f)));
     } catch (e) {
       if (!(e instanceof AppError) || e.code === 'bad_request') throw e;
       // quota or upstream failure: fall through to Photon
     }
   }
-  if (hits.length === 0) hits = await geocodePhoton(text, f);
+  if (!havePrecise()) {
+    try {
+      hits.push(...(await geocodePhoton(text, f)));
+    } catch (e) {
+      if (hits.length === 0) throw e;
+    }
+  }
   if (hits.length === 0) throw new AppError('geocode_failed', `Couldn't find "${text}". Try adding the city and state.`);
-  return { results: hits, ambiguous: isAmbiguous(hits) };
+
+  const precise = dedupe(hits.filter((h) => h.precise)).slice(0, 3);
+  if (precise.length) return { results: precise, ambiguous: isAmbiguous(precise), precise: true };
+  // Nothing pinpoints the address: show the closest areas and make the user confirm.
+  return { results: dedupe(hits).slice(0, 3), ambiguous: true, precise: false };
 }
 
 export interface MatrixResult {

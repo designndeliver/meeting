@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { findMeetingPoints, type MeetDeps } from '../src/lib/meet';
 import { AppError } from '../src/lib/errors';
 import { parseOverpass, buildQuery } from '../src/lib/overpass';
-import { isAmbiguous, parsePelias, parsePhoton } from '../src/lib/ors';
+import { geocode, isAmbiguous, looksLikeStreetAddress, parseCensus, parsePelias, parsePhoton } from '../src/lib/ors';
 
 const a = { lat: 29.7858, lon: -95.8244 };
 const b = { lat: 29.9691, lon: -95.6972 };
@@ -133,11 +133,11 @@ describe('geocode parsing', () => {
   it('parses Pelias and flags ambiguity by confidence', () => {
     const hits = parsePelias({
       features: [
-        { geometry: { coordinates: [-95.8, 29.7] }, properties: { label: 'A, Katy, TX', confidence: 1 } },
-        { geometry: { coordinates: [-95.9, 29.6] }, properties: { label: 'A, Houston, TX', confidence: 0.6 } },
+        { geometry: { coordinates: [-95.8, 29.7] }, properties: { label: 'A, Katy, TX', confidence: 1, layer: 'address', match_type: 'exact' } },
+        { geometry: { coordinates: [-95.9, 29.6] }, properties: { label: 'A, Houston, TX', confidence: 0.6, layer: 'address', match_type: 'exact' } },
       ],
     });
-    expect(hits[0]).toEqual({ lat: 29.7, lon: -95.8, label: 'A, Katy, TX', confidence: 1 });
+    expect(hits[0]).toMatchObject({ lat: 29.7, lon: -95.8, label: 'A, Katy, TX', confidence: 1 });
     expect(isAmbiguous(hits)).toBe(false);
     expect(isAmbiguous([hits[0], { ...hits[1], confidence: 0.98 }])).toBe(true);
     expect(isAmbiguous([hits[0]])).toBe(false);
@@ -154,5 +154,85 @@ describe('geocode parsing', () => {
     });
     expect(hits[0].label).toBe('1 Main St, Katy, Texas, USA');
     expect(isAmbiguous(hits)).toBe(true);
+  });
+});
+
+describe('geocode precision', () => {
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+  const censusHit = { result: { addressMatches: [{ matchedAddress: '2946 GRANITE VALE RD, HOUSTON, TX, 77084', coordinates: { x: -95.6953, y: 29.8109 } }] } };
+  const orsCityOnly = {
+    features: [
+      { geometry: { coordinates: [-95.36, 29.78] }, properties: { label: 'Houston, TX, USA', confidence: 0.6, layer: 'locality', match_type: 'fallback' } },
+      { geometry: { coordinates: [-95.43, 31.33] }, properties: { label: 'Houston County, TX, USA', confidence: 0.4, layer: 'county', match_type: 'fallback' } },
+    ],
+  };
+  const fakeFetch = (routes: { census?: unknown; ors?: unknown; photon?: unknown }) =>
+    (async (url: string) => {
+      if (url.includes('census.gov')) return json(routes.census ?? { result: { addressMatches: [] } });
+      if (url.includes('openrouteservice')) return json(routes.ors ?? { features: [] });
+      return json(routes.photon ?? { features: [] });
+    }) as unknown as typeof fetch;
+
+  it('treats an exact Pelias match on a city as precise, but a fallback as approximate', () => {
+    const [exact, fallback] = parsePelias({
+      features: [
+        { geometry: { coordinates: [-95.8, 29.79] }, properties: { label: 'Katy, TX, USA', confidence: 1, layer: 'locality', match_type: 'exact' } },
+        { geometry: { coordinates: [-95.4, 29.78] }, properties: { label: 'Houston, TX, USA', confidence: 0.6, layer: 'locality', match_type: 'fallback' } },
+      ],
+    });
+    expect(exact.precise).toBe(true);
+    expect(fallback.precise).toBe(false);
+  });
+
+  it('detects street-address-shaped input', () => {
+    expect(looksLikeStreetAddress('2946 Granite Vale Rd, Houston, TX')).toBe(true);
+    expect(looksLikeStreetAddress('The Woodlands Mall')).toBe(false);
+  });
+
+  it('parses Census matches as precise and tidies the label', () => {
+    const [h] = parseCensus(censusHit);
+    expect(h).toMatchObject({ lat: 29.8109, lon: -95.6953, precise: true });
+    expect(h.label).toBe('2946 Granite Vale Rd, Houston, TX 77084');
+  });
+
+  it('prefers the Census match over an ORS city-level fallback', async () => {
+    const r = await geocode('2946 Granite Vale Rd, Houston, TX 77084', 'key', fakeFetch({ census: censusHit, ors: orsCityOnly }));
+    expect(r.precise).toBe(true);
+    expect(r.ambiguous).toBe(false);
+    expect(r.results).toHaveLength(1);
+    expect(r.results[0].label).toContain('Granite Vale');
+  });
+
+  it('flags results as approximate when only areas match, and requires confirmation', async () => {
+    const r = await geocode('99999 Nowhere Ln, Houston, TX', 'key', fakeFetch({ ors: orsCityOnly }));
+    expect(r.precise).toBe(false);
+    expect(r.ambiguous).toBe(true);
+    expect(r.results.every((h) => !h.precise)).toBe(true);
+  });
+
+  it('falls through to Photon, and keeps only precise hits when any exist', async () => {
+    const photon = {
+      features: [
+        { geometry: { coordinates: [-95.45, 30.16] }, properties: { type: 'house', name: 'The Woodlands Mall', city: 'The Woodlands', state: 'Texas' } },
+        { geometry: { coordinates: [-95.46, 30.17] }, properties: { type: 'city', name: 'The Woodlands', state: 'Texas' } },
+      ],
+    };
+    const r = await geocode('The Woodlands Mall', 'key', fakeFetch({ ors: orsCityOnly, photon }));
+    expect(r.precise).toBe(true);
+    expect(r.results.map((h) => h.label)).toEqual(['The Woodlands Mall, The Woodlands, Texas']);
+  });
+
+  it('does not call Census for non-street input', async () => {
+    const calls: string[] = [];
+    const f = (async (url: string) => {
+      calls.push(url);
+      return json({ features: [] });
+    }) as unknown as typeof fetch;
+    await geocode('Katy Mills', undefined, f).catch(() => undefined);
+    expect(calls.some((u) => u.includes('census.gov'))).toBe(false);
+  });
+
+  it('throws geocode_failed when nobody finds anything', async () => {
+    await expect(geocode('zzzz qqqq', 'key', fakeFetch({}))).rejects.toMatchObject({ code: 'geocode_failed' });
   });
 });

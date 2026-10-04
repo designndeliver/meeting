@@ -50,7 +50,7 @@
       import L from 'leaflet';
       import 'leaflet/dist/leaflet.css';
 
-      interface Hit { lat: number; lon: number; label: string; confidence: number | null }
+      interface Hit { lat: number; lon: number; label: string; confidence: number | null; precise?: boolean }
       interface Leg { duration: number; distance: number }
       interface Result {
         poi: { name: string; category: string; lat: number; lon: number };
@@ -146,10 +146,10 @@
       };
       const fmtDist = (m: number) => (miles ? `${(m / 1609.344).toFixed(1)} mi` : `${(m / 1000).toFixed(1)} km`);
 
-      function showChoices(row: HTMLElement, text: string, hits: Hit[]) {
+      function showChoices(row: HTMLElement, text: string, hits: Hit[], precise: boolean) {
         row.querySelector('.choices')?.remove();
         const fs = el('fieldset', { class: 'choices' });
-        fs.append(el('legend', {}, 'Did you mean:'));
+        fs.append(el('legend', {}, precise ? 'Did you mean:' : "Couldn't find that exact address. Closest matches:"));
         hits.forEach((h, k) => {
           const id = `${row.dataset.slot}-c${k}`;
           const lab = el('label', { class: 'choice', htmlFor: id });
@@ -176,10 +176,15 @@
             setStatus(`Looking up address ${i + 1} of ${texts.length}…`);
             let hit = resolved.get(texts[i]);
             if (!hit) {
-              const g = await post<{ results: Hit[]; ambiguous: boolean }>('/api/geocode', { q: texts[i] });
+              const g = await post<{ results: Hit[]; ambiguous: boolean; precise: boolean }>('/api/geocode', { q: texts[i] });
               if (g.ambiguous) {
-                showChoices(rows[i], texts[i], g.results);
-                setStatus(`"${texts[i]}" matches more than one place. Pick the right one above.`, 'error');
+                showChoices(rows[i], texts[i], g.results, g.precise);
+                setStatus(
+                  g.precise
+                    ? `"${texts[i]}" matches more than one place. Pick the right one above.`
+                    : `Couldn't pinpoint "${texts[i]}". Check the address, or pick the closest match above (the result will be approximate).`,
+                  'error',
+                );
                 return;
               }
               hit = g.results[0];
