@@ -62,7 +62,7 @@
       }
       interface Leg { duration: number; distance: number }
       interface Result {
-        poi: { name: string; category: string; lat: number; lon: number };
+        poi: { name: string; category: string; lat: number; lon: number; address?: string };
         legs: Leg[];
         max: number;
         spread: number;
@@ -281,6 +281,7 @@
           head.append(el('span', { class: 'rank' }, String(k + 1)), el('span', { class: 'name' }, r.poi.name),
             el('span', { class: 'cat' }, CATEGORY_LABEL[r.poi.category] ?? 'Place'));
           head.addEventListener('click', () => select(out, origins, k));
+          const addr = r.poi.address ? el('p', { class: 'addr' }, r.poi.address) : null;
           const fair = el('p', { class: 'fair' }, fmtSpread(r, out.metric));
           const ul = el('ul', { class: 'legs' });
           r.legs.forEach((leg, i) => {
@@ -290,7 +291,7 @@
             item.append(dot, document.createTextNode(` ${fmtTime(leg.duration)} · ${fmtDist(leg.distance)}`));
             ul.append(item);
           });
-          li.append(head, fair, ul);
+          if (addr) li.append(head, addr, fair, ul); else li.append(head, fair, ul);
           listEl.append(li);
         });
         map.invalidateSize();
@@ -365,6 +366,7 @@
       .rank { flex: none; width: 26px; height: 26px; border-radius: 50%; background: var(--fg); color: var(--bg); display: grid; place-items: center; font-weight: 700; font-size: .85rem; }
       .name { font-weight: 700; flex: 1; }
       .cat { color: var(--muted); font-size: .85rem; text-transform: capitalize; }
+      .addr { margin: 0 0 0 36px; color: var(--fg); font-size: .9rem; }
       .fair { margin: 2px 0 6px 36px; color: var(--muted); font-size: .9rem; }
       .legs { list-style: none; margin: 0 0 4px 36px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: .95rem; }
       .legs li { display: flex; align-items: center; gap: 4px; }

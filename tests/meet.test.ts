@@ -3,6 +3,7 @@ import { findMeetingPoints, type MeetDeps } from '../src/lib/meet';
 import { AppError } from '../src/lib/errors';
 import { parseOverpass, buildQuery } from '../src/lib/overpass';
 import { CATEGORIES, categoryOf, parseCategories } from '../src/lib/categories';
+import { pickAddress, reverseAddress } from '../src/lib/reverse';
 import { disambiguate, geocode, hasUsSignal, isAmbiguous, looksLikeStreetAddress, nameCoverage, parseCensus, rankByName, parsePelias, parsePhoton } from '../src/lib/ors';
 
 const a = { lat: 29.7858, lon: -95.8244 };
@@ -387,5 +388,56 @@ describe('pelias detail', () => {
       ],
     });
     expect(hit.detail).toBe('19914 Park Row Dr, 77449');
+  });
+});
+
+describe('place addresses', () => {
+  const feat = (lon: number, lat: number, properties: Record<string, string | undefined>) => ({ geometry: { coordinates: [lon, lat] as [number, number] }, properties });
+  const at = { lat: 29.7838, lon: -95.5749 };
+
+  it('uses the same-named feature, with house number when present', () => {
+    const feats = [
+      feat(-95.575, 29.7839, { type: 'house', name: 'Exxon', street: 'Wycliffe Drive', city: 'Houston' }),
+      feat(-95.5752, 29.7841, { type: 'house', name: 'Honey Farms', housenumber: '11035', street: 'Katy Freeway', city: 'Houston' }),
+    ];
+    expect(pickAddress('Exxon', at, feats)).toBe('Wycliffe Drive, Houston');
+    expect(pickAddress('Honey Farms', at, feats)).toBe('11035 Katy Freeway, Houston');
+  });
+
+  it('matches names loosely (case, punctuation)', () => {
+    const feats = [feat(-95.575, 29.7839, { type: 'house', name: "McDonald's", street: 'North Wilcrest Drive', city: 'Houston' })];
+    expect(pickAddress('MCDONALDS', at, feats)).toBe('North Wilcrest Drive, Houston');
+  });
+
+  it("says 'near' the closest street when no feature carries the place's name", () => {
+    const feats = [
+      feat(-95.5752, 29.7841, { type: 'house', name: 'Food Mart', street: 'Memorial Drive', city: 'Houston' }),
+      feat(-95.57, 29.79, { type: 'street', name: 'Butterfly Lane', city: 'Houston' }),
+    ];
+    expect(pickAddress('Chevron', at, feats)).toBe('near Memorial Drive, Houston');
+  });
+
+  it('returns null when there is nothing to go on', () => {
+    expect(pickAddress('Shell', at, [])).toBeNull();
+    expect(pickAddress('Shell', at, [feat(-95.5, 29.7, { type: 'city', name: 'Houston' })])).toBeNull();
+  });
+
+  it('reverseAddress handles http errors by returning null', async () => {
+    const f = (async () => new Response('nope', { status: 404 })) as unknown as typeof fetch;
+    expect(await reverseAddress('Shell', at, f)).toBeNull();
+  });
+
+  it('reads OSM address tags when a place has them', () => {
+    const [p, q] = parseOverpass(
+      {
+        elements: [
+          { type: 'node', id: 1, lat: 30, lon: -95, tags: { name: 'Tagged', amenity: 'fuel', 'addr:housenumber': '12', 'addr:street': 'Main St', 'addr:city': 'Katy' } },
+          { type: 'node', id: 2, lat: 30.001, lon: -95, tags: { name: 'Bare', amenity: 'fuel' } },
+        ],
+      },
+      { lat: 30, lon: -95 },
+    );
+    expect(p.address).toBe('12 Main St, Katy');
+    expect(q.address).toBeUndefined();
   });
 });

@@ -8,6 +8,8 @@ export interface Poi extends LatLon {
   id: string;
   name: string;
   category: string;
+  /** street address, when OpenStreetMap has it or a reverse lookup found it */
+  address?: string;
 }
 
 // Public Overpass can be slow or unreachable from some networks (overpass-api.de itself returned 521
@@ -28,6 +30,12 @@ export function buildQuery(seed: LatLon, radiusM: number, categories: readonly s
   }
   const parts = [...byTag].map(([tag, values]) => `nw["${tag}"~"^(${values.join('|')})$"]["name"]${around};`);
   return `[out:json][timeout:25];(${parts.join('')});out center 800;`;
+}
+
+function addressFromTags(tags: Record<string, string | undefined> | undefined): string | undefined {
+  const street = [tags?.['addr:housenumber'], tags?.['addr:street']].filter(Boolean).join(' ');
+  if (!street) return undefined;
+  return [street, tags?.['addr:city']].filter(Boolean).join(', ');
 }
 
 interface OverpassElement {
@@ -52,6 +60,7 @@ export function parseOverpass(json: { elements?: OverpassElement[] }, seed: LatL
       lat,
       lon,
       category: categoryOf(el.tags),
+      address: addressFromTags(el.tags),
     });
   }
   return pois
