@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { findMeetingPoints, type MeetDeps } from '../src/lib/meet';
 import { AppError } from '../src/lib/errors';
 import { parseOverpass, buildQuery } from '../src/lib/overpass';
-import { geocode, hasUsSignal, isAmbiguous, looksLikeStreetAddress, nameCoverage, parseCensus, rankByName, parsePelias, parsePhoton } from '../src/lib/ors';
+import { CATEGORIES, categoryOf, parseCategories } from '../src/lib/categories';
+import { disambiguate, geocode, hasUsSignal, isAmbiguous, looksLikeStreetAddress, nameCoverage, parseCensus, rankByName, parsePelias, parsePhoton } from '../src/lib/ors';
 
 const a = { lat: 29.7858, lon: -95.8244 };
 const b = { lat: 29.9691, lon: -95.6972 };
@@ -124,7 +125,7 @@ describe('overpass parsing', () => {
   it('builds a query with amenities and parks', () => {
     const q = buildQuery({ lat: 30, lon: -95 }, 2000);
     expect(q).toContain('cafe|restaurant|fast_food|library');
-    expect(q).toContain('"leisure"="park"');
+    expect(q).toContain('"leisure"~"^(park)$"');
     expect(q).toContain('around:2000,30.00000,-95.00000');
   });
 });
@@ -319,5 +320,72 @@ describe('rankByName', () => {
   it('falls back to ordering by coverage when nothing matches exactly', () => {
     const out = rankByName('Starbucks Katy', [hit('Katy Freeway, Houston'), hit('Starbucks, Katy, TX')]);
     expect(out[0].label).toContain('Starbucks');
+  });
+});
+
+describe('categories', () => {
+  it('parses a selection: keeps valid keys, drops junk, falls back to defaults', () => {
+    expect(parseCategories(['bar', 'gas_station', 'nope', 7])).toEqual(['bar', 'gas_station']);
+    expect(parseCategories(['nope'])).toEqual(['cafe', 'restaurant', 'fast_food', 'library', 'park']);
+    expect(parseCategories(undefined)).toEqual(['cafe', 'restaurant', 'fast_food', 'library', 'park']);
+    expect(parseCategories(['park', 'park', 'cafe'])).toEqual(['cafe', 'park']);
+  });
+
+  it('maps OSM tags to a category', () => {
+    expect(categoryOf({ amenity: 'pub' })).toBe('bar');
+    expect(categoryOf({ amenity: 'fuel' })).toBe('gas_station');
+    expect(categoryOf({ shop: 'mall' })).toBe('mall');
+    expect(categoryOf({ leisure: 'park' })).toBe('park');
+    expect(categoryOf({ amenity: 'bank' })).toBe('place');
+    expect(categoryOf(undefined)).toBe('place');
+  });
+
+  it('every category has a unique key and at least one value', () => {
+    expect(new Set(CATEGORIES.map((c) => c.key)).size).toBe(CATEGORIES.length);
+    expect(CATEGORIES.every((c) => c.values.length > 0)).toBe(true);
+  });
+
+  it('builds a query only for the chosen categories, grouped by tag', () => {
+    const q = buildQuery({ lat: 30, lon: -95 }, 2000, ['bar', 'gas_station', 'mall']);
+    expect(q).toContain('"amenity"~"^(bar|pub|biergarten|fuel)$"');
+    expect(q).toContain('"shop"~"^(mall)$"');
+    expect(q).not.toContain('leisure');
+    expect(q).not.toContain('restaurant');
+    expect(q).toContain('around:2000,30.00000,-95.00000');
+  });
+});
+
+describe('disambiguate', () => {
+  const h = (lat: number, lon: number, detail?: string) => ({ lat, lon, label: 'Starbucks, Katy, TX, USA', confidence: null, precise: true, detail });
+  it('leaves distinct labels alone and strips their detail', () => {
+    const out = disambiguate([{ ...h(29.7, -95.8, '1 Main St'), label: 'A' }, { ...h(29.8, -95.7, '2 Main St'), label: 'B' }]);
+    expect(out.every((x) => x.detail === undefined && x.compass === undefined)).toBe(true);
+  });
+  it('keeps street detail and adds direction for colliding labels', () => {
+    const out = disambiguate([h(29.9, -95.7, '19914 Park Row Dr, 77449'), h(29.7, -95.7), h(29.8, -95.6, '1711 Westgreen Blvd')]);
+    expect(out[0].detail).toBe('19914 Park Row Dr, 77449');
+    expect(out[0].compass).toBe('north');
+    expect(out[1].compass).toBe('south');
+    expect(out[2].compass).toBe('east');
+    expect(out.every((x) => x.fromNearKm === undefined)).toBe(true);
+  });
+  it('adds distance from the near point when given', () => {
+    const out = disambiguate([h(29.81, -95.69), h(29.7, -95.8)], { lat: 29.81, lon: -95.69 });
+    expect(out[0].fromNearKm).toBe(0);
+    expect(out[1].fromNearKm).toBeGreaterThan(10);
+  });
+});
+
+describe('pelias detail', () => {
+  it('captures street address and postcode', () => {
+    const [hit] = parsePelias({
+      features: [
+        {
+          geometry: { coordinates: [-95.8, 29.7] },
+          properties: { label: 'Starbucks, Katy, TX, USA', confidence: 1, layer: 'venue', match_type: 'exact', housenumber: '19914', street: 'Park Row Dr', neighbourhood: 'Eldridge', postalcode: '77449' },
+        },
+      ],
+    });
+    expect(hit.detail).toBe('19914 Park Row Dr, 77449');
   });
 });

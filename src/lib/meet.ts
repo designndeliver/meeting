@@ -111,7 +111,7 @@ export async function findMeetingPoints(input: MeetInput, deps: MeetDeps): Promi
 
   const top = rank();
   if (top.length === 0) {
-    throw new AppError('no_pois', 'No reachable cafes, restaurants, parks or libraries found near the middle. Try different addresses.');
+    throw new AppError('no_pois', 'No reachable places of the chosen types were found near the middle. Try more place types or different addresses.');
   }
 
   const results: MeetResult[] = top.map((s) => ({

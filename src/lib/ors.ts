@@ -17,6 +17,12 @@ export interface GeocodeHit extends LatLon {
   precise: boolean;
   /** ISO 3166-1 alpha-2, when the geocoder says */
   country?: string;
+  /** street address or neighbourhood, used to tell apart results that share a label */
+  detail?: string;
+  /** set only on results whose label collides with another: direction from the group's centre */
+  compass?: string;
+  /** set only on colliding results when the caller gave a `near` point */
+  fromNearKm?: number;
 }
 
 export interface GeocodeResult {
@@ -37,10 +43,25 @@ function checkOrsStatus(res: Response) {
 
 interface PeliasFeature {
   geometry: { coordinates: [number, number] };
-  properties: { label?: string; confidence?: number; layer?: string; match_type?: string; country_a?: string };
+  properties: {
+    label?: string;
+    confidence?: number;
+    layer?: string;
+    match_type?: string;
+    country_a?: string;
+    housenumber?: string;
+    street?: string;
+    neighbourhood?: string;
+    postalcode?: string;
+  };
 }
 
 const PELIAS_PRECISE_LAYERS = new Set(['address', 'venue', 'street']);
+
+function joinDetail(...parts: (string | undefined)[]): string | undefined {
+  const out = parts.filter(Boolean).join(', ');
+  return out || undefined;
+}
 
 export function parsePelias(json: { features?: PeliasFeature[] }): GeocodeHit[] {
   return (json.features ?? [])
@@ -54,6 +75,10 @@ export function parsePelias(json: { features?: PeliasFeature[] }): GeocodeHit[] 
       // which is wrong for an address; an exact match on a city ("Katy, TX") is a legitimate answer.
       precise: f.properties.match_type ? f.properties.match_type !== 'fallback' : PELIAS_PRECISE_LAYERS.has(f.properties.layer ?? ''),
       country: f.properties.country_a === 'USA' ? 'US' : f.properties.country_a,
+      detail: joinDetail(
+        f.properties.street ? [f.properties.housenumber, f.properties.street].filter(Boolean).join(' ') : f.properties.neighbourhood,
+        f.properties.postalcode,
+      ),
     }));
 }
 
@@ -80,6 +105,7 @@ export function parsePhoton(json: { features?: PhotonFeature[] }): GeocodeHit[] 
         confidence: null,
         precise: !PHOTON_AREA_TYPES.has(p.type ?? ''),
         country: p.countrycode,
+        detail: joinDetail(street || undefined, p.postcode),
       };
     })
     .filter((h) => h.label);
@@ -201,6 +227,41 @@ export function rankByName(text: string, hits: GeocodeHit[]): GeocodeHit[] {
   return [...hits].sort((a, b) => whole(b) - whole(a) || lead(b) - lead(a));
 }
 
+const COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest'];
+
+function compassFrom(from: LatLon, to: LatLon): string {
+  const dy = to.lat - from.lat;
+  const dx = (to.lon - from.lon) * Math.cos((from.lat * Math.PI) / 180);
+  const deg = (Math.atan2(dx, dy) * 180) / Math.PI;
+  return COMPASS[Math.round(((deg + 360) % 360) / 45) % 8];
+}
+
+/**
+ * Results that share a label ("Starbucks, Katy, TX") are indistinguishable in a list. For just those,
+ * attach what tells them apart: street address if known, otherwise direction (and distance from `near`).
+ */
+export function disambiguate(hits: GeocodeHit[], near?: LatLon): GeocodeHit[] {
+  const key = (h: GeocodeHit) => h.label.trim().toLowerCase();
+  const counts = new Map<string, number>();
+  for (const h of hits) counts.set(key(h), (counts.get(key(h)) ?? 0) + 1);
+  // Direction is measured from the centre of each group of look-alikes, so it says how they differ from each other.
+  const centreOf = (k: string) => {
+    const group = hits.filter((h) => key(h) === k);
+    return {
+      lat: group.reduce((a, h) => a + h.lat, 0) / group.length,
+      lon: group.reduce((a, h) => a + h.lon, 0) / group.length,
+    };
+  };
+  return hits.map((h) => {
+    if ((counts.get(key(h)) ?? 0) < 2) return { ...h, detail: undefined };
+    return {
+      ...h,
+      compass: compassFrom(centreOf(key(h)), h),
+      ...(near ? { fromNearKm: Math.round(haversineKm(near, h) * 10) / 10 } : {}),
+    };
+  });
+}
+
 function dedupe(hits: GeocodeHit[]): GeocodeHit[] {
   const out: GeocodeHit[] = [];
   for (const h of hits) if (!out.some((o) => haversineKm(o, h) < 0.15)) out.push(h);
@@ -262,9 +323,9 @@ export async function geocode(text: string, key: string | undefined, f: Fetch = 
 
   const preciseHits = hits.filter((h) => h.precise);
   const precise = dedupe(street ? preciseHits : rankByName(text, preciseHits)).slice(0, 3);
-  if (precise.length) return { results: precise, ambiguous: isAmbiguous(precise), precise: true };
+  if (precise.length) return { results: disambiguate(precise, near), ambiguous: isAmbiguous(precise), precise: true };
   // Nothing pinpoints the address: show the closest areas and make the user confirm.
-  return { results: dedupe(hits).slice(0, 3), ambiguous: true, precise: false };
+  return { results: disambiguate(dedupe(hits).slice(0, 3), near), ambiguous: true, precise: false };
 }
 
 export interface MatrixResult {

@@ -1,4 +1,5 @@
 import { AppError, UA } from './errors';
+import { CATEGORIES, DEFAULT_CATEGORIES, categoryOf } from './categories';
 import { haversineKm, type LatLon } from './geo';
 
 type Fetch = typeof fetch;
@@ -9,8 +10,6 @@ export interface Poi extends LatLon {
   category: string;
 }
 
-export const DEFAULT_CATEGORIES = ['cafe', 'restaurant', 'fast_food', 'library', 'park'] as const;
-
 // Public Overpass can be slow or unreachable from some networks (overpass-api.de itself returned 521
 // to Cloudflare Workers), so try several healthy servers in order, each with its own timeout.
 const ENDPOINTS: { url: string; timeoutMs: number }[] = [
@@ -20,11 +19,14 @@ const ENDPOINTS: { url: string; timeoutMs: number }[] = [
 ];
 
 export function buildQuery(seed: LatLon, radiusM: number, categories: readonly string[] = DEFAULT_CATEGORIES): string {
-  const amenities = categories.filter((c) => c !== 'park');
   const around = `(around:${Math.round(radiusM)},${seed.lat.toFixed(5)},${seed.lon.toFixed(5)})`;
-  const parts: string[] = [];
-  if (amenities.length) parts.push(`nw["amenity"~"^(${amenities.join('|')})$"]["name"]${around};`);
-  if (categories.includes('park')) parts.push(`nw["leisure"="park"]["name"]${around};`);
+  // Group the chosen categories by OSM tag so one clause covers e.g. bar|pub|biergarten.
+  const byTag = new Map<string, string[]>();
+  for (const c of CATEGORIES) {
+    if (!categories.includes(c.key)) continue;
+    byTag.set(c.tag, [...(byTag.get(c.tag) ?? []), ...c.values]);
+  }
+  const parts = [...byTag].map(([tag, values]) => `nw["${tag}"~"^(${values.join('|')})$"]["name"]${around};`);
   return `[out:json][timeout:25];(${parts.join('')});out center 800;`;
 }
 
@@ -49,7 +51,7 @@ export function parseOverpass(json: { elements?: OverpassElement[] }, seed: LatL
       name,
       lat,
       lon,
-      category: el.tags?.amenity ?? el.tags?.leisure ?? 'place',
+      category: categoryOf(el.tags),
     });
   }
   return pois

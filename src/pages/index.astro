@@ -27,6 +27,11 @@
           <label class="choice"><input type="radio" name="metric" value="distance" /> Distance</label>
         </fieldset>
 
+        <fieldset id="types">
+          <legend>Meet at</legend>
+          <div class="chips" id="chips"></div>
+        </fieldset>
+
         <p class="hint">Driving directions. Addresses are used only to look up places and are not stored by this app.</p>
         <button type="submit" id="go">Find a place to meet</button>
       </form>
@@ -49,8 +54,12 @@
     <script>
       import L from 'leaflet';
       import 'leaflet/dist/leaflet.css';
+      import { CATEGORIES, CATEGORY_LABEL, DEFAULT_CATEGORIES } from '../lib/categories';
 
-      interface Hit { lat: number; lon: number; label: string; confidence: number | null; precise?: boolean }
+      interface Hit {
+        lat: number; lon: number; label: string; confidence: number | null; precise?: boolean;
+        detail?: string; compass?: string; fromNearKm?: number;
+      }
       interface Leg { duration: number; distance: number }
       interface Result {
         poi: { name: string; category: string; lat: number; lon: number };
@@ -156,6 +165,12 @@
           const r = el('input', { type: 'radio', name: `choice-${row.dataset.slot}`, id });
           r.addEventListener('change', () => { resolved.set(text, h); fs.remove(); form.requestSubmit(); });
           lab.append(r, document.createTextNode(' ' + h.label));
+          const extra = [
+            h.detail,
+            !h.detail && h.compass ? `${h.compass} side` : undefined,
+            h.fromNearKm !== undefined ? `${fmtDist(h.fromNearKm * 1000)} from the first address` : undefined,
+          ].filter(Boolean).join(' · ');
+          if (extra) lab.append(el('span', { class: 'extra' }, extra));
           fs.append(lab);
         });
         row.append(fs);
@@ -167,6 +182,9 @@
         const rows = [...addressesEl.children] as HTMLElement[];
         const texts = rows.map((r) => (r.querySelector('input[type=text]') as HTMLInputElement).value.trim());
         if (texts.some((t) => t.length < 3)) { setStatus('Enter every address (at least 3 characters).', 'error'); return; }
+
+        const categories = chosenTypes();
+        if (categories.length === 0) { setStatus('Pick at least one type of place to meet at.', 'error'); return; }
 
         goBtn.disabled = true;
         resultsEl.hidden = true;
@@ -195,7 +213,7 @@
           const metric = (form.elements.namedItem('metric') as RadioNodeList).value;
           setStatus('Finding fair places to meet…');
           const out = await post<MeetOut>('/api/meet', {
-            origins: origins.map(({ lat, lon }) => ({ lat, lon })), metric, mode: 'driving',
+            origins: origins.map(({ lat, lon }) => ({ lat, lon })), metric, mode: 'driving', categories,
           });
           setStatus('');
           render(out, origins);
@@ -261,7 +279,7 @@
           const li = el('li', { class: 'card' });
           const head = el('button', { type: 'button', class: 'card-head' });
           head.append(el('span', { class: 'rank' }, String(k + 1)), el('span', { class: 'name' }, r.poi.name),
-            el('span', { class: 'cat' }, r.poi.category.replace('_', ' ')));
+            el('span', { class: 'cat' }, CATEGORY_LABEL[r.poi.category] ?? 'Place'));
           head.addEventListener('click', () => select(out, origins, k));
           const fair = el('p', { class: 'fair' }, fmtSpread(r, out.metric));
           const ul = el('ul', { class: 'legs' });
@@ -279,6 +297,16 @@
         select(out, origins, 0);
         resultsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
+
+      const chipsEl = $('chips');
+      for (const c of CATEGORIES) {
+        const id = `type-${c.key}`;
+        const lab = el('label', { class: 'chip', htmlFor: id });
+        const box = el('input', { type: 'checkbox', id, value: c.key, checked: DEFAULT_CATEGORIES.includes(c.key) });
+        lab.append(box, el('span', {}, c.label));
+        chipsEl.append(lab);
+      }
+      const chosenTypes = () => [...chipsEl.querySelectorAll('input:checked')].map((i) => (i as HTMLInputElement).value);
 
       addBtn.addEventListener('click', () => { if (addressesEl.children.length < MAX_ADDRESSES) addRow(); });
       addRow(); addRow();
@@ -320,6 +348,12 @@
       fieldset { border: 0; padding: 0; margin: 16px 0 0; }
       legend { font-weight: 600; padding: 0; }
       .choice { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 6px 0; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+      .chip { display: inline-flex; align-items: center; gap: 6px; margin: 0; padding: 7px 12px; font-weight: 500; border: 1px solid var(--line); border-radius: 999px; background: var(--card); cursor: pointer; }
+      .chip:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+      .chip:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+      .extra { flex-basis: 100%; margin: 0 0 0 26px; color: var(--muted); font-size: .85rem; font-weight: 400; }
+      .choices label.choice { flex-wrap: wrap; }
       .choices { margin: 8px 0 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
       #status { min-height: 1.5em; margin: 12px 0; }
       #status.error { color: var(--err); font-weight: 600; }

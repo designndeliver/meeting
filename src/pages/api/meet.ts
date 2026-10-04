@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { env } from 'cloudflare:workers';
 import { cachedJson } from '../../lib/cache';
+import { parseCategories } from '../../lib/categories';
 import { AppError } from '../../lib/errors';
 import { errorResponse, guard, json, readJson } from '../../lib/http';
 import type { LatLon } from '../../lib/geo';
@@ -35,13 +36,17 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     const metric = body.metric === 'distance' ? 'distance' : 'duration';
     const mode = MODES.includes(body.mode as Mode) ? (body.mode as Mode) : 'driving';
 
+    const categories = parseCategories(body.categories);
+
     const out = await findMeetingPoints(
       { origins, metric, mode },
       {
         // Cache key uses a coarse (~100 m) grid of the seed, never the addresses.
         pois: (seed, radiusKm) =>
-          cachedJson(`poi-v2/${seed.lat.toFixed(3)}/${seed.lon.toFixed(3)}/${Math.round(radiusKm * 10)}`, 6 * 3600, async () =>
-            parseOverpass(await fetchOverpass(buildQuery(seed, radiusKm * 1000)), seed),
+          cachedJson(
+            `poi-v3/${seed.lat.toFixed(3)}/${seed.lon.toFixed(3)}/${Math.round(radiusKm * 10)}/${categories.join('+')}`,
+            6 * 3600,
+            async () => parseOverpass(await fetchOverpass(buildQuery(seed, radiusKm * 1000, categories)), seed),
           ),
         matrix: (m, o, d) => matrix(m, o, d, env.ORS_API_KEY),
       },
