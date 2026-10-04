@@ -1,0 +1,336 @@
+---
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Find a fair place to meet: a cafe, restaurant, park or library about equally far from everyone." />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%232563eb'/><circle cx='16' cy='16' r='5' fill='white'/></svg>" />
+    <title>Meeting Point</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Meeting Point</h1>
+        <p class="lede">Find a fair place to meet. Enter where everyone is starting and get cafes, restaurants, parks and libraries that are about equally far for all.</p>
+      </header>
+
+      <form id="form" novalidate>
+        <div id="addresses"></div>
+        <button type="button" id="add" class="secondary">+ Add address</button>
+
+        <fieldset>
+          <legend>Make it fair by</legend>
+          <label class="choice"><input type="radio" name="metric" value="duration" checked /> Travel time</label>
+          <label class="choice"><input type="radio" name="metric" value="distance" /> Distance</label>
+        </fieldset>
+
+        <p class="hint">Driving directions. Addresses are used only to look up places and are not stored by this app.</p>
+        <button type="submit" id="go">Find a place to meet</button>
+      </form>
+
+      <div id="status" role="status" aria-live="polite"></div>
+
+      <section id="results" hidden>
+        <h2 id="results-title">Best places</h2>
+        <p id="results-note" class="hint"></p>
+        <div id="map" role="region" aria-label="Map of the results"></div>
+        <ol id="list"></ol>
+      </section>
+    </main>
+
+    <footer>
+      <a href="https://vinaygoel.com">vinaygoel.com</a>
+      · Maps © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors
+    </footer>
+
+    <script>
+      import L from 'leaflet';
+      import 'leaflet/dist/leaflet.css';
+
+      interface Hit { lat: number; lon: number; label: string; confidence: number | null }
+      interface Leg { duration: number; distance: number }
+      interface Result {
+        poi: { name: string; category: string; lat: number; lon: number };
+        legs: Leg[];
+        max: number;
+        spread: number;
+        equidistance: string;
+      }
+      interface MeetOut { seed: { lat: number; lon: number }; radiusKm: number; widened: boolean; metric: 'duration' | 'distance'; results: Result[] }
+
+      const MAX_ADDRESSES = 3; // phase 1; the API already accepts up to 10
+      const COLORS = ['#2563eb', '#db2777', '#059669', '#d97706', '#7c3aed', '#0891b2'];
+      const miles = (navigator.language || 'en-US').toLowerCase().startsWith('en-us');
+
+      const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+      const form = $<HTMLFormElement>('form');
+      const addressesEl = $('addresses');
+      const addBtn = $<HTMLButtonElement>('add');
+      const goBtn = $<HTMLButtonElement>('go');
+      const statusEl = $('status');
+      const resultsEl = $('results');
+      const listEl = $('list');
+      const noteEl = $('results-note');
+
+      const resolved = new Map<string, Hit>(); // typed text -> chosen location
+      let count = 0;
+
+      function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> & { class?: string } = {}, text?: string) {
+        const node = document.createElement(tag);
+        const { class: cls, ...rest } = props;
+        if (cls) node.className = cls;
+        Object.assign(node, rest);
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function addRow() {
+        const i = count++;
+        const row = el('div', { class: 'row' });
+        row.dataset.slot = String(i);
+        const label = el('label', { htmlFor: `addr-${i}` }, `Person ${String.fromCharCode(65 + addressesEl.children.length)}'s address`);
+        const input = el('input', {
+          id: `addr-${i}`, type: 'text', autocomplete: 'street-address', placeholder: 'Street, city, state', required: true,
+        });
+        input.addEventListener('input', () => { row.querySelector('.choices')?.remove(); });
+        const wrap = el('div', { class: 'field' });
+        wrap.append(input);
+        if (addressesEl.children.length >= 2) {
+          const rm = el('button', { type: 'button', class: 'icon', ariaLabel: 'Remove this address' }, '×');
+          rm.addEventListener('click', () => { row.remove(); relabel(); });
+          wrap.append(rm);
+        }
+        row.append(label, wrap);
+        addressesEl.append(row);
+        relabel();
+      }
+
+      function relabel() {
+        [...addressesEl.children].forEach((row, n) => {
+          const l = row.querySelector('label');
+          if (l) l.textContent = `Person ${String.fromCharCode(65 + n)}'s address`;
+        });
+        addBtn.hidden = addressesEl.children.length >= MAX_ADDRESSES;
+      }
+
+      function setStatus(msg: string, kind: 'info' | 'error' = 'info') {
+        statusEl.textContent = msg;
+        statusEl.className = msg ? kind : '';
+      }
+
+      async function post<T>(url: string, body: unknown): Promise<T> {
+        let res: Response;
+        try {
+          res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        } catch {
+          throw new Error("Can't reach the server. Check your connection and try again.");
+        }
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw new Error(data?.error?.message ?? 'Something went wrong. Please try again.');
+        return data as T;
+      }
+
+      const fmtTime = (s: number) => {
+        const m = Math.max(1, Math.round(s / 60));
+        return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+      };
+      const fmtDist = (m: number) => (miles ? `${(m / 1609.344).toFixed(1)} mi` : `${(m / 1000).toFixed(1)} km`);
+
+      function showChoices(row: HTMLElement, text: string, hits: Hit[]) {
+        row.querySelector('.choices')?.remove();
+        const fs = el('fieldset', { class: 'choices' });
+        fs.append(el('legend', {}, 'Did you mean:'));
+        hits.forEach((h, k) => {
+          const id = `${row.dataset.slot}-c${k}`;
+          const lab = el('label', { class: 'choice', htmlFor: id });
+          const r = el('input', { type: 'radio', name: `choice-${row.dataset.slot}`, id });
+          r.addEventListener('change', () => { resolved.set(text, h); fs.remove(); form.requestSubmit(); });
+          lab.append(r, document.createTextNode(' ' + h.label));
+          fs.append(lab);
+        });
+        row.append(fs);
+        (fs.querySelector('input') as HTMLInputElement | null)?.focus();
+      }
+
+      form.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const rows = [...addressesEl.children] as HTMLElement[];
+        const texts = rows.map((r) => (r.querySelector('input[type=text]') as HTMLInputElement).value.trim());
+        if (texts.some((t) => t.length < 3)) { setStatus('Enter every address (at least 3 characters).', 'error'); return; }
+
+        goBtn.disabled = true;
+        resultsEl.hidden = true;
+        try {
+          const origins: Hit[] = [];
+          for (let i = 0; i < texts.length; i++) {
+            setStatus(`Looking up address ${i + 1} of ${texts.length}…`);
+            let hit = resolved.get(texts[i]);
+            if (!hit) {
+              const g = await post<{ results: Hit[]; ambiguous: boolean }>('/api/geocode', { q: texts[i] });
+              if (g.ambiguous) {
+                showChoices(rows[i], texts[i], g.results);
+                setStatus(`"${texts[i]}" matches more than one place. Pick the right one above.`, 'error');
+                return;
+              }
+              hit = g.results[0];
+              resolved.set(texts[i], hit);
+            }
+            origins.push(hit);
+          }
+          const metric = (form.elements.namedItem('metric') as RadioNodeList).value;
+          setStatus('Finding fair places to meet…');
+          const out = await post<MeetOut>('/api/meet', {
+            origins: origins.map(({ lat, lon }) => ({ lat, lon })), metric, mode: 'driving',
+          });
+          setStatus('');
+          render(out, origins);
+        } catch (e) {
+          setStatus(e instanceof Error ? e.message : 'Something went wrong.', 'error');
+        } finally {
+          goBtn.disabled = false;
+        }
+      });
+
+      let map: L.Map | null = null;
+      let layer: L.LayerGroup | null = null;
+
+      function pin(text: string, color: string, cls = '') {
+        return L.divIcon({
+          className: '',
+          html: `<span class="pin ${cls}" style="background:${color}">${text}</span>`,
+          iconSize: [28, 28], iconAnchor: [14, 14],
+        });
+      }
+
+      function draw(out: MeetOut, origins: Hit[], selected: number) {
+        if (!map) return;
+        layer?.remove();
+        layer = L.layerGroup().addTo(map);
+        const bounds = L.latLngBounds([]);
+        const sel = out.results[selected].poi;
+        origins.forEach((o, i) => {
+          const c = COLORS[i % COLORS.length];
+          L.marker([o.lat, o.lon], { icon: pin(String.fromCharCode(65 + i), c), title: o.label }).addTo(layer!);
+          L.polyline([[o.lat, o.lon], [sel.lat, sel.lon]], { color: c, weight: 3, dashArray: '6 6', opacity: 0.8 }).addTo(layer!);
+          bounds.extend([o.lat, o.lon]);
+        });
+        out.results.forEach((r, k) => {
+          if (k === selected) return;
+          L.marker([r.poi.lat, r.poi.lon], { icon: pin(String(k + 1), '#6b7280', 'small'), title: r.poi.name })
+            .on('click', () => select(out, origins, k)).addTo(layer!);
+          bounds.extend([r.poi.lat, r.poi.lon]);
+        });
+        L.marker([sel.lat, sel.lon], { icon: pin(String(selected + 1), '#111827', 'big'), title: sel.name, zIndexOffset: 1000 }).addTo(layer!);
+        bounds.extend([sel.lat, sel.lon]);
+        map.fitBounds(bounds, { padding: [32, 32], maxZoom: 15 });
+      }
+
+      function select(out: MeetOut, origins: Hit[], k: number) {
+        [...listEl.children].forEach((li, n) => li.classList.toggle('active', n === k));
+        draw(out, origins, k);
+      }
+
+      function render(out: MeetOut, origins: Hit[]) {
+        resultsEl.hidden = false;
+        const by = out.metric === 'duration' ? 'travel time' : 'distance';
+        noteEl.textContent = `Ranked so the person with the longest trip has the shortest one possible, by ${by}.` +
+          (out.widened ? ' The search area was widened to find a fairer spot.' : '');
+        if (!map) {
+          map = L.map('map', { scrollWheelZoom: false });
+          L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+          }).addTo(map);
+        }
+        listEl.replaceChildren();
+        out.results.forEach((r, k) => {
+          const li = el('li', { class: 'card' });
+          const head = el('button', { type: 'button', class: 'card-head' });
+          head.append(el('span', { class: 'rank' }, String(k + 1)), el('span', { class: 'name' }, r.poi.name),
+            el('span', { class: 'cat' }, r.poi.category.replace('_', ' ')));
+          head.addEventListener('click', () => select(out, origins, k));
+          const fair = el('p', { class: 'fair' }, r.equidistance);
+          const ul = el('ul', { class: 'legs' });
+          r.legs.forEach((leg, i) => {
+            const item = el('li');
+            const dot = el('span', { class: 'dot' }, String.fromCharCode(65 + i));
+            dot.style.background = COLORS[i % COLORS.length];
+            item.append(dot, document.createTextNode(` ${fmtTime(leg.duration)} · ${fmtDist(leg.distance)}`));
+            ul.append(item);
+          });
+          li.append(head, fair, ul);
+          listEl.append(li);
+        });
+        map.invalidateSize();
+        select(out, origins, 0);
+        resultsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+
+      addBtn.addEventListener('click', () => { if (addressesEl.children.length < MAX_ADDRESSES) addRow(); });
+      addRow(); addRow();
+    </script>
+
+    <style is:global>
+      :root {
+        --bg: #f8fafc; --fg: #0f172a; --muted: #475569; --card: #ffffff; --line: #cbd5e1;
+        --accent: #2563eb; --accent-fg: #ffffff; --err: #b91c1c; --focus: #1d4ed8;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0b1220; --fg: #e5e7eb; --muted: #94a3b8; --card: #121a2b; --line: #2b3650;
+          --accent: #3b82f6; --accent-fg: #06101f; --err: #fca5a5; --focus: #93c5fd;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+      main { max-width: 760px; margin: 0 auto; padding: 24px 16px 8px; }
+      h1 { margin: 0 0 4px; font-size: 1.75rem; }
+      h2 { font-size: 1.2rem; margin: 24px 0 4px; }
+      .lede, .hint { color: var(--muted); margin: 0 0 16px; }
+      .hint { font-size: .9rem; margin: 8px 0; }
+      label { display: block; font-weight: 600; margin: 12px 0 4px; }
+      .field { display: flex; gap: 8px; }
+      input[type=text] {
+        flex: 1; min-width: 0; padding: 12px; font: inherit; color: inherit; background: var(--card);
+        border: 1px solid var(--line); border-radius: 10px;
+      }
+      :is(input, button, a):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+      button { font: inherit; cursor: pointer; }
+      #go {
+        width: 100%; padding: 14px; margin-top: 8px; border: 0; border-radius: 10px; font-weight: 700;
+        background: var(--accent); color: var(--accent-fg);
+      }
+      #go:disabled { opacity: .6; cursor: progress; }
+      .secondary { margin-top: 12px; background: none; border: 1px dashed var(--line); color: var(--fg); padding: 10px 14px; border-radius: 10px; }
+      .icon { width: 44px; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 10px; font-size: 1.3rem; }
+      fieldset { border: 0; padding: 0; margin: 16px 0 0; }
+      legend { font-weight: 600; padding: 0; }
+      .choice { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 6px 0; }
+      .choices { margin: 8px 0 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+      #status { min-height: 1.5em; margin: 12px 0; }
+      #status.error { color: var(--err); font-weight: 600; }
+      #map { height: 340px; border-radius: 12px; border: 1px solid var(--line); margin: 8px 0 16px; }
+      ol { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+      .card.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+      .card-head { display: flex; align-items: center; gap: 10px; width: 100%; background: none; border: 0; padding: 4px 0; color: inherit; text-align: left; }
+      .rank { flex: none; width: 26px; height: 26px; border-radius: 50%; background: var(--fg); color: var(--bg); display: grid; place-items: center; font-weight: 700; font-size: .85rem; }
+      .name { font-weight: 700; flex: 1; }
+      .cat { color: var(--muted); font-size: .85rem; text-transform: capitalize; }
+      .fair { margin: 2px 0 6px 36px; color: var(--muted); font-size: .9rem; }
+      .legs { list-style: none; margin: 0 0 4px 36px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: .95rem; }
+      .legs li { display: flex; align-items: center; gap: 4px; }
+      .dot, .pin { display: inline-grid; place-items: center; color: #fff; font-weight: 700; border-radius: 50%; }
+      .dot { width: 20px; height: 20px; font-size: .7rem; }
+      .pin { width: 28px; height: 28px; font-size: .85rem; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.45); }
+      .pin.small { width: 22px; height: 22px; font-size: .7rem; margin: 3px; }
+      .pin.big { width: 34px; height: 34px; margin: -3px; }
+      footer { max-width: 760px; margin: 24px auto; padding: 0 16px; color: var(--muted); font-size: .9rem; }
+      footer a { color: inherit; }
+      [hidden] { display: none !important; }
+      .leaflet-container { font: inherit; }
+    </style>
+  </body>
+</html>
