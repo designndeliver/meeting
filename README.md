@@ -31,7 +31,7 @@ npx wrangler secret put ORS_API_KEY
 npm run deploy
 ```
 `wrangler.jsonc` attaches the custom domain `meeting.vinaygoel.com`; Cloudflare creates the DNS record and certificate.
-Optional auto-deploy: Workers & Pages, the `meeting` Worker, Settings, Builds, connect the repo (build `npm run build`, deploy `npx wrangler deploy`).
+Auto-deploy is connected through Workers Builds: every push to `main` runs `npm run build && npm test`, then `npx wrangler deploy`.
 
 ## Notes
 - Rate limiting is best-effort in memory per Worker isolate. For a hard limit add a Cloudflare rate-limiting rule on `/api/*`.
