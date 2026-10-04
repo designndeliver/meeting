@@ -15,6 +15,8 @@ export interface GeocodeHit extends LatLon {
   confidence: number | null;
   /** false when the geocoder only matched an area (city, county, neighbourhood), not the address itself */
   precise: boolean;
+  /** ISO 3166-1 alpha-2, when the geocoder says */
+  country?: string;
 }
 
 export interface GeocodeResult {
@@ -35,7 +37,7 @@ function checkOrsStatus(res: Response) {
 
 interface PeliasFeature {
   geometry: { coordinates: [number, number] };
-  properties: { label?: string; confidence?: number; layer?: string; match_type?: string };
+  properties: { label?: string; confidence?: number; layer?: string; match_type?: string; country_a?: string };
 }
 
 const PELIAS_PRECISE_LAYERS = new Set(['address', 'venue', 'street']);
@@ -51,6 +53,7 @@ export function parsePelias(json: { features?: PeliasFeature[] }): GeocodeHit[] 
       // Pelias answers with a "fallback" centroid of the city/county when it can't match the whole query,
       // which is wrong for an address; an exact match on a city ("Katy, TX") is a legitimate answer.
       precise: f.properties.match_type ? f.properties.match_type !== 'fallback' : PELIAS_PRECISE_LAYERS.has(f.properties.layer ?? ''),
+      country: f.properties.country_a === 'USA' ? 'US' : f.properties.country_a,
     }));
 }
 
@@ -76,6 +79,7 @@ export function parsePhoton(json: { features?: PhotonFeature[] }): GeocodeHit[] 
         label,
         confidence: null,
         precise: !PHOTON_AREA_TYPES.has(p.type ?? ''),
+        country: p.countrycode,
       };
     })
     .filter((h) => h.label);
@@ -97,8 +101,10 @@ export function isAmbiguous(hits: GeocodeHit[]): boolean {
   return true;
 }
 
-async function geocodeOrs(text: string, key: string, f: Fetch): Promise<GeocodeHit[]> {
-  const url = `${ORS}/geocode/search?size=3&text=${encodeURIComponent(text)}`;
+async function geocodeOrs(text: string, key: string, f: Fetch, near?: LatLon, us = false): Promise<GeocodeHit[]> {
+  let url = `${ORS}/geocode/search?size=5&text=${encodeURIComponent(text)}`;
+  if (us) url += '&boundary.country=US';
+  if (near) url += `&focus.point.lat=${near.lat}&focus.point.lon=${near.lon}`;
   const res = await f(url, { headers: { Authorization: key, 'User-Agent': UA }, signal: AbortSignal.timeout(10_000) });
   checkOrsStatus(res);
   return parsePelias(await res.json());
@@ -130,8 +136,9 @@ async function geocodeCensus(text: string, f: Fetch): Promise<GeocodeHit[]> {
   return parseCensus(await res.json());
 }
 
-async function geocodePhoton(text: string, f: Fetch): Promise<GeocodeHit[]> {
-  const url = `https://photon.komoot.io/api/?limit=3&q=${encodeURIComponent(text)}`;
+async function geocodePhoton(text: string, f: Fetch, near?: LatLon): Promise<GeocodeHit[]> {
+  let url = `https://photon.komoot.io/api/?limit=5&lang=en&q=${encodeURIComponent(text)}`;
+  if (near) url += `&lat=${near.lat}&lon=${near.lon}`;
   const res = await f(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new AppError('upstream', `Geocoder error (${res.status}).`);
   return parsePhoton(await res.json());
@@ -140,6 +147,58 @@ async function geocodePhoton(text: string, f: Fetch): Promise<GeocodeHit[]> {
 /** "2946 Granite Vale Rd, Houston, TX": a number followed by a street name. */
 export function looksLikeStreetAddress(text: string): boolean {
   return /^\s*\d+[A-Za-z]?\s+\S+/.test(text);
+}
+
+/** A ZIP code or a ", TX"-style state suffix: the user is clearly typing a US address. */
+export function hasUsSignal(text: string): boolean {
+  return /\b\d{5}(-\d{4})?\b/.test(text) || /,\s*[A-Za-z]{2}\b\s*(\d{5}(-\d{4})?)?\s*(,?\s*(USA|US|United States))?\s*$/.test(text);
+}
+
+const STOPWORDS = new Set(['the', 'a', 'an', 'at', 'of', 'and', 'in', 'on']);
+const ABBREV: Record<string, string> = {
+  rd: 'road', st: 'street', dr: 'drive', cir: 'circle', blvd: 'boulevard', ave: 'avenue', ln: 'lane',
+  pkwy: 'parkway', hwy: 'highway', ct: 'court', apts: 'apartments', apt: 'apartment',
+};
+
+function tokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t && !STOPWORDS.has(t))
+    .map((t) => ABBREV[t] ?? t)
+    .map((t) => (t.length > 3 && t.endsWith('s') ? t.slice(0, -1) : t));
+}
+
+/**
+ * Share of the typed place name (text before the first comma) that appears in the hit's label.
+ * Pelias will happily return "Energy, Wales" for "Vista Energy Corridor, Houston": one word matched.
+ */
+export function nameCoverage(text: string, label: string): number {
+  const want = tokens(text.split(',')[0]);
+  if (want.length === 0) return 1;
+  const have = new Set(tokens(label));
+  return want.filter((t) => have.has(t)).length / want.length;
+}
+
+const MIN_COVERAGE = 0.6;
+
+/**
+ * For a place name, results whose own name (label up to the first comma) is exactly what was typed
+ * beat partial matches like "Wyndham Houston West Energy Corridor" or "Cardiff Castle Road".
+ * With no exact name, order by how much of the typed name each covers.
+ */
+export function rankByName(text: string, hits: GeocodeHit[]): GeocodeHit[] {
+  const want = new Set(tokens(text.split(',')[0]));
+  const own = (h: GeocodeHit) => new Set(tokens(h.label.split(',')[0]));
+  const exact = hits.filter((h) => {
+    const have = own(h);
+    return have.size === want.size && [...want].every((t) => have.has(t));
+  });
+  if (exact.length) return exact;
+  const whole = (h: GeocodeHit) => nameCoverage(text, h.label);
+  const lead = (h: GeocodeHit) => nameCoverage(text, h.label.split(',')[0]);
+  return [...hits].sort((a, b) => whole(b) - whole(a) || lead(b) - lead(a));
 }
 
 function dedupe(hits: GeocodeHit[]): GeocodeHit[] {
@@ -151,13 +210,22 @@ function dedupe(hits: GeocodeHit[]): GeocodeHit[] {
 /**
  * Order matters: the US Census geocoder is authoritative for US street addresses (and free, keyless),
  * OpenRouteService covers places and the world, Photon is the last resort. A source is only
- * consulted further down the list if nothing before it pinpointed the address.
+ * consulted further down the list if nothing before it gave a precise, relevant match.
+ *
+ * `near` (an address the user already entered) biases ranking toward their area.
  */
-export async function geocode(text: string, key: string | undefined, f: Fetch = fetch): Promise<GeocodeResult> {
+export async function geocode(text: string, key: string | undefined, f: Fetch = fetch, near?: LatLon): Promise<GeocodeResult> {
+  const street = looksLikeStreetAddress(text);
+  const us = hasUsSignal(text);
+
+  // Drop hits that are in the wrong country, or (for place names) don't cover what was typed.
+  const relevant = (hits: GeocodeHit[]) =>
+    hits.filter((h) => (!us || !h.country || h.country === 'US') && (street || nameCoverage(text, h.label) >= MIN_COVERAGE));
+
   const hits: GeocodeHit[] = [];
   const havePrecise = () => hits.some((h) => h.precise);
 
-  if (looksLikeStreetAddress(text)) {
+  if (street) {
     try {
       hits.push(...(await geocodeCensus(text, f)));
     } catch {
@@ -166,7 +234,7 @@ export async function geocode(text: string, key: string | undefined, f: Fetch = 
   }
   if (!havePrecise() && key) {
     try {
-      hits.push(...(await geocodeOrs(text, key, f)));
+      hits.push(...relevant(await geocodeOrs(text, key, f, near, us)));
     } catch (e) {
       if (!(e instanceof AppError) || e.code === 'bad_request') throw e;
       // quota or upstream failure: fall through to Photon
@@ -174,14 +242,26 @@ export async function geocode(text: string, key: string | undefined, f: Fetch = 
   }
   if (!havePrecise()) {
     try {
-      hits.push(...(await geocodePhoton(text, f)));
+      // Photon has no "fallback" flag. A neighbourhood or complex it names exactly as typed is the answer.
+      const named = relevant(await geocodePhoton(text, f, near)).map((h) =>
+        !street && !h.precise && nameCoverage(text, h.label) >= 0.99 ? { ...h, precise: true } : h,
+      );
+      hits.push(...named);
     } catch (e) {
       if (hits.length === 0) throw e;
     }
   }
-  if (hits.length === 0) throw new AppError('geocode_failed', `Couldn't find "${text}". Try adding the city and state.`);
+  if (hits.length === 0) {
+    throw new AppError(
+      'geocode_failed',
+      street
+        ? `Couldn't find "${text}". Check the spelling and add the city and state.`
+        : `Couldn't find "${text}". Try its street address instead, e.g. "123 Main St, Houston, TX".`,
+    );
+  }
 
-  const precise = dedupe(hits.filter((h) => h.precise)).slice(0, 3);
+  const preciseHits = hits.filter((h) => h.precise);
+  const precise = dedupe(street ? preciseHits : rankByName(text, preciseHits)).slice(0, 3);
   if (precise.length) return { results: precise, ambiguous: isAmbiguous(precise), precise: true };
   // Nothing pinpoints the address: show the closest areas and make the user confirm.
   return { results: dedupe(hits).slice(0, 3), ambiguous: true, precise: false };

@@ -176,7 +176,7 @@
             setStatus(`Looking up address ${i + 1} of ${texts.length}…`);
             let hit = resolved.get(texts[i]);
             if (!hit) {
-              const g = await post<{ results: Hit[]; ambiguous: boolean; precise: boolean }>('/api/geocode', { q: texts[i] });
+              const g = await post<{ results: Hit[]; ambiguous: boolean; precise: boolean }>('/api/geocode', { q: texts[i], near: origins[0] ? { lat: origins[0].lat, lon: origins[0].lon } : undefined });
               if (g.ambiguous) {
                 showChoices(rows[i], texts[i], g.results, g.precise);
                 setStatus(

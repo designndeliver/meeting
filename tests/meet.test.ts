@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { findMeetingPoints, type MeetDeps } from '../src/lib/meet';
 import { AppError } from '../src/lib/errors';
 import { parseOverpass, buildQuery } from '../src/lib/overpass';
-import { geocode, isAmbiguous, looksLikeStreetAddress, parseCensus, parsePelias, parsePhoton } from '../src/lib/ors';
+import { geocode, hasUsSignal, isAmbiguous, looksLikeStreetAddress, nameCoverage, parseCensus, rankByName, parsePelias, parsePhoton } from '../src/lib/ors';
 
 const a = { lat: 29.7858, lon: -95.8244 };
 const b = { lat: 29.9691, lon: -95.6972 };
@@ -234,5 +234,90 @@ describe('geocode precision', () => {
 
   it('throws geocode_failed when nobody finds anything', async () => {
     await expect(geocode('zzzz qqqq', 'key', fakeFetch({}))).rejects.toMatchObject({ code: 'geocode_failed' });
+  });
+});
+
+describe('place-name relevance', () => {
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+  const pelias = (label: string, country_a = 'USA') => ({
+    geometry: { coordinates: [-95.4, 29.7] },
+    properties: { label, confidence: 1, layer: 'street', match_type: 'exact', country_a },
+  });
+  const energyJunk = {
+    features: [pelias('Energy, Glyncorrwg, Wales, United Kingdom', 'GBR'), pelias('Energy, LG, Philippines', 'PHL'), pelias('Energy, Limestone, ME, USA')],
+  };
+  const photonVista = {
+    features: [
+      { geometry: { coordinates: [-95.6408, 29.7572] }, properties: { type: 'locality', name: 'Vista Energy Corridor', city: 'Houston', state: 'Texas', countrycode: 'US' } },
+    ],
+  };
+
+  it('scores how much of the typed name a result covers', () => {
+    expect(nameCoverage('Vista Energy Corridor, Houston, TX', 'Energy, Limestone, ME, USA')).toBeCloseTo(1 / 3, 5);
+    expect(nameCoverage('Vista Energy Corridor, Houston, TX', 'Vista Energy Corridor, Houston, Texas')).toBe(1);
+    expect(nameCoverage('Katy Mills Cir', 'Katy Mills Circle, Katy, TX, USA')).toBe(1);
+    expect(nameCoverage('Estates at Fountain Lake Apartments', 'Estates at Wellington Green Aparments, Wellington')).toBeLessThan(0.6);
+  });
+
+  it('detects US context from a ZIP code or state suffix', () => {
+    expect(hasUsSignal('Vista Energy Corridor, Houston, TX 77077')).toBe(true);
+    expect(hasUsSignal('Katy, TX')).toBe(true);
+    expect(hasUsSignal('Cardiff Castle, Wales')).toBe(false);
+    expect(hasUsSignal('Estates at Fountain Lake Apartments')).toBe(false);
+  });
+
+  it('ignores ORS keyword junk and finds the place through Photon', async () => {
+    const f = (async (url: string) => (url.includes('openrouteservice') ? json(energyJunk) : json(photonVista))) as unknown as typeof fetch;
+    const r = await geocode('Vista Energy Corridor, Houston, TX 77077', 'key', f);
+    expect(r.precise).toBe(true);
+    expect(r.results).toHaveLength(1);
+    expect(r.results[0].label).toContain('Vista Energy Corridor');
+  });
+
+  it('drops non-US hits when the input is clearly a US address', async () => {
+    const mixed = { features: [pelias('Vista Energy Corridor, Wales, United Kingdom', 'GBR'), pelias('Vista Energy Corridor, Houston, TX, USA')] };
+    const f = (async () => json(mixed)) as unknown as typeof fetch;
+    const r = await geocode('Vista Energy Corridor, Houston, TX', 'key', f);
+    expect(r.results.map((h) => h.label)).toEqual(['Vista Energy Corridor, Houston, TX, USA']);
+  });
+
+  it('fails clearly, rather than showing junk, for a place nobody has', async () => {
+    const photonFar = {
+      features: [{ geometry: { coordinates: [-80.2, 26.6] }, properties: { type: 'locality', name: 'Estates at Wellington Green Aparments', city: 'Wellington', state: 'Florida', countrycode: 'US' } }],
+    };
+    const f = (async (url: string) => (url.includes('openrouteservice') ? json({ features: [] }) : json(photonFar))) as unknown as typeof fetch;
+    await expect(geocode('Estates at Fountain Lake Apartments', 'key', f)).rejects.toMatchObject({
+      code: 'geocode_failed',
+      message: expect.stringContaining('street address'),
+    });
+  });
+
+  it('passes the location bias to ORS and Photon', async () => {
+    const urls: string[] = [];
+    const f = (async (url: string) => {
+      urls.push(url);
+      return json({ features: [] });
+    }) as unknown as typeof fetch;
+    await geocode('Some Place', 'key', f, { lat: 29.78, lon: -95.6 }).catch(() => undefined);
+    expect(urls.find((u) => u.includes('openrouteservice'))).toContain('focus.point.lat=29.78');
+    expect(urls.find((u) => u.includes('photon'))).toContain('lat=29.78&lon=-95.6');
+  });
+});
+
+describe('rankByName', () => {
+  const hit = (label: string) => ({ lat: 0, lon: 0, label, confidence: null, precise: true });
+  it('keeps only results named exactly as typed when there are any', () => {
+    const out = rankByName('Vista Energy Corridor, Houston, TX', [
+      hit('Wyndham Houston West Energy Corridor, Park Row, Houston'),
+      hit('Vista Energy Corridor, Houston, Texas'),
+    ]);
+    expect(out.map((h) => h.label)).toEqual(['Vista Energy Corridor, Houston, Texas']);
+    const castle = rankByName('Cardiff Castle, Wales', [hit('Cardiff Castle Road, Dublin'), hit('Cardiff Castle, Cardiff County, Wales')]);
+    expect(castle).toHaveLength(1);
+    expect(castle[0].label).toContain('Cardiff County');
+  });
+  it('falls back to ordering by coverage when nothing matches exactly', () => {
+    const out = rankByName('Starbucks Katy', [hit('Katy Freeway, Houston'), hit('Starbucks, Katy, TX')]);
+    expect(out[0].label).toContain('Starbucks');
   });
 });
