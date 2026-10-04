@@ -11,10 +11,12 @@ export interface Poi extends LatLon {
 
 export const DEFAULT_CATEGORIES = ['cafe', 'restaurant', 'fast_food', 'library', 'park'] as const;
 
-// Public Overpass can be slow under load (10-15 s is normal at busy times), so the primary gets a long timeout.
+// Public Overpass can be slow or unreachable from some networks (overpass-api.de itself returned 521
+// to Cloudflare Workers), so try several healthy servers in order, each with its own timeout.
 const ENDPOINTS: { url: string; timeoutMs: number }[] = [
-  { url: 'https://overpass-api.de/api/interpreter', timeoutMs: 28_000 },
-  { url: 'https://overpass.private.coffee/api/interpreter', timeoutMs: 15_000 },
+  { url: 'https://lz4.overpass-api.de/api/interpreter', timeoutMs: 20_000 },
+  { url: 'https://z.overpass-api.de/api/interpreter', timeoutMs: 15_000 },
+  { url: 'https://overpass.openstreetmap.fr/api/interpreter', timeoutMs: 15_000 },
 ];
 
 export function buildQuery(seed: LatLon, radiusM: number, categories: readonly string[] = DEFAULT_CATEGORIES): string {
@@ -69,8 +71,10 @@ export async function fetchOverpass(query: string, f: Fetch = fetch): Promise<{ 
       });
       if (res.ok) return await res.json();
       lastStatus = res.status;
-    } catch {
+      console.warn(`overpass ${new URL(url).host} status ${res.status}`);
+    } catch (e) {
       lastStatus = 0;
+      console.warn(`overpass ${new URL(url).host} failed: ${e instanceof Error ? `${e.name}: ${e.message}` : 'unknown'}`);
     }
   }
   throw new AppError('upstream', `Place lookup is busy right now (${lastStatus || 'network'}). Try again in a moment.`);
