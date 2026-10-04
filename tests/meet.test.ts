@@ -6,12 +6,20 @@ import { isAmbiguous, parsePelias, parsePhoton } from '../src/lib/ors';
 
 const a = { lat: 29.7858, lon: -95.8244 };
 const b = { lat: 29.9691, lon: -95.6972 };
-const poi = (i: number) => ({ id: `node/${i}`, name: `Place ${i}`, lat: 29.88, lon: -95.76, category: 'cafe' });
+const poi = (i: number) => ({ id: `node/${i}`, name: `Place ${i}`, lat: 29.88 + i * 0.002, lon: -95.76 - i * 0.001, category: 'cafe' });
 
-function deps(pois: ReturnType<typeof poi>[], d: number[][], dist = d.map((r) => r.map((x) => x * 10))): MeetDeps {
+/** Matrix mock: durations/distances looked up by place name, so tests control exactly who is fair. */
+function deps(
+  pool: ReturnType<typeof poi>[],
+  dur: Record<string, number[]>,
+  dist: Record<string, number[]> = Object.fromEntries(Object.entries(dur).map(([k, v]) => [k, v.map((x) => x * 10)])),
+): MeetDeps {
   return {
-    pois: async () => pois,
-    matrix: async () => ({ durations: d, distances: dist }),
+    pois: async () => pool,
+    matrix: async (_m, origins, dests) => ({
+      durations: origins.map((_, p) => dests.map((d) => dur[d.name]?.[p] ?? null)),
+      distances: origins.map((_, p) => dests.map((d) => dist[d.name]?.[p] ?? null)),
+    }),
   };
 }
 
@@ -19,60 +27,78 @@ describe('findMeetingPoints', () => {
   it('ranks by the chosen metric and reports per-person legs', async () => {
     const out = await findMeetingPoints(
       { origins: [a, b], metric: 'duration', mode: 'driving' },
-      deps([poi(1), poi(2)], [[300, 600], [900, 620]]),
+      deps([poi(1), poi(2)], { 'Place 1': [300, 900], 'Place 2': [600, 620] }),
     );
     expect(out.results[0].poi.name).toBe('Place 2');
     expect(out.results[0].legs).toHaveLength(2);
     expect(out.results[0].legs[1].distance).toBe(6200);
     expect(out.results[0].equidistance).toBe('within a minute of each other');
+    expect(out.refined).toBe(false);
   });
 
   it('ranks by distance when asked', async () => {
     const out = await findMeetingPoints(
       { origins: [a, b], metric: 'distance', mode: 'driving' },
-      deps([poi(1), poi(2)], [[100, 100], [100, 100]], [[5000, 3000], [5000, 3500]]),
+      deps([poi(1), poi(2)], { 'Place 1': [100, 100], 'Place 2': [100, 100] }, { 'Place 1': [5000, 3000], 'Place 2': [5000, 3500] }),
     );
+    // Place 1 max 5000, Place 2 max 5000 -> tie on max, spread 2000 vs 1500 -> Place 2
     expect(out.results[0].poi.name).toBe('Place 2');
-    expect(out.results[0].max).toBe(3500);
   });
 
-  it('widens once when the first pick is lopsided and keeps the better result', async () => {
-    const pois = vi.fn();
-    pois.mockResolvedValueOnce([poi(1)]).mockResolvedValueOnce([poi(2)]);
-    const matrix = vi.fn();
-    matrix
-      .mockResolvedValueOnce({ durations: [[300], [1000]], distances: [[1], [1]] })
-      .mockResolvedValueOnce({ durations: [[700], [720]], distances: [[1], [1]] });
-    const out = await findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, { pois, matrix });
+  it('refines around a lopsided first pick and keeps the fairer result', async () => {
+    const pool = Array.from({ length: 60 }, (_, i) => poi(i + 1));
+    const calls: string[][] = [];
+    const matrix = vi.fn(async (_m: unknown, origins: unknown[], dests: { name: string }[]) => {
+      calls.push(dests.map((d) => d.name));
+      const lopsided = calls.length === 1;
+      const row = (v: number) => dests.map(() => v);
+      return {
+        durations: origins.map((_, p) => row(lopsided ? (p === 0 ? 300 : 1000) : p === 0 ? 700 : 720)),
+        distances: origins.map(() => row(1)),
+      };
+    });
+    const out = await findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, { pois: async () => pool, matrix } as unknown as MeetDeps);
+    expect(matrix).toHaveBeenCalledTimes(2);
+    expect(calls[0]).toHaveLength(40);
+    expect(calls[1].every((n) => !calls[0].includes(n))).toBe(true);
+    expect(calls[1]).toHaveLength(20); // only 20 places were left unevaluated
+    expect(out.refined).toBe(true);
+    expect(out.results[0].max).toBe(720);
+    expect(calls[1]).toContain(out.results[0].poi.name);
+  });
+
+  it('does not refine when the first pick is already fair', async () => {
+    const matrix = vi.fn(async (_m: unknown, o: unknown[], d: unknown[]) => ({
+      durations: o.map((_, p) => d.map(() => 600 + p * 20)),
+      distances: o.map((_) => d.map(() => 1)),
+    }));
+    const out = await findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, { pois: async () => [poi(1), poi(2)], matrix } as MeetDeps);
+    expect(matrix).toHaveBeenCalledTimes(1);
+    expect(out.refined).toBe(false);
+  });
+
+  it('widens the area once when the first lookup is empty', async () => {
+    const pois = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([poi(1)]);
+    const matrix = vi.fn(async (_m: unknown, o: unknown[], d: unknown[]) => ({
+      durations: o.map(() => d.map(() => 600)),
+      distances: o.map(() => d.map(() => 1)),
+    }));
+    const out = await findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, { pois, matrix } as MeetDeps);
     expect(pois).toHaveBeenCalledTimes(2);
-    expect(out.widened).toBe(true);
-    expect(out.results[0].poi.name).toBe('Place 2');
-  });
-
-  it('does not widen when the first pick is already fair', async () => {
-    const pois = vi.fn().mockResolvedValue([poi(1)]);
-    const matrix = vi.fn().mockResolvedValue({ durations: [[600], [620]], distances: [[1], [1]] });
-    const out = await findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, { pois, matrix });
-    expect(pois).toHaveBeenCalledTimes(1);
-    expect(out.widened).toBe(false);
+    expect(out.results[0].poi.name).toBe('Place 1');
   });
 
   it('throws no_pois when nothing is found or everything is unreachable', async () => {
+    await expect(findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, deps([], {}))).rejects.toMatchObject({ code: 'no_pois' });
     await expect(
-      findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, deps([], [[], []])),
-    ).rejects.toMatchObject({ code: 'no_pois' });
-    await expect(
-      findMeetingPoints(
-        { origins: [a, b], metric: 'duration', mode: 'driving' },
-        { pois: async () => [poi(1)], matrix: async () => ({ durations: [[null], [5]], distances: [[null], [5]] }) },
-      ),
+      findMeetingPoints({ origins: [a, b], metric: 'duration', mode: 'driving' }, deps([poi(1)], {})),
     ).rejects.toBeInstanceOf(AppError);
   });
 
   it('works for three origins', async () => {
     const out = await findMeetingPoints(
       { origins: [a, b, { lat: 30.1658, lon: -95.4613 }], metric: 'duration', mode: 'driving' },
-      deps([poi(1), poi(2)], [[600, 900], [650, 300], [640, 1000]]),
+      deps([poi(1), poi(2)], { 'Place 1': [600, 650, 640], 'Place 2': [900, 300, 1000] }),
     );
     expect(out.results[0].poi.name).toBe('Place 1');
     expect(out.results[0].legs).toHaveLength(3);

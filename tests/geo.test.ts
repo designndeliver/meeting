@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { geometricMedian, haversineKm, searchRadiusKm } from '../src/lib/geo';
+import { geometricMedian, haversineKm, searchRadiusKm, spreadSelect } from '../src/lib/geo';
 
 const katy = { lat: 29.7858, lon: -95.8244 };
 const cypress = { lat: 29.9691, lon: -95.6972 };
@@ -67,5 +67,32 @@ describe('searchRadiusKm', () => {
     const a = { lat: 30, lon: -95 };
     const b = { lat: 35, lon: -90 };
     expect(searchRadiusKm([a, b], geometricMedian([a, b]))).toBe(15);
+  });
+});
+
+describe('weighted geometricMedian', () => {
+  it('moves toward the heavier point', () => {
+    const plain = geometricMedian([katy, woodlands]);
+    const pulled = geometricMedian([katy, woodlands], [1, 3]);
+    expect(haversineKm(pulled, woodlands)).toBeLessThan(haversineKm(plain, woodlands));
+  });
+});
+
+describe('spreadSelect', () => {
+  it('covers the area instead of clustering near the seed', () => {
+    const seed = { lat: 30, lon: -95 };
+    // 50 points packed within ~100 m of the seed, plus 5 spread far out
+    const dense = Array.from({ length: 50 }, (_, i) => ({ lat: 30 + i * 1e-5, lon: -95 }));
+    const far = [0.05, 0.1, 0.15, 0.2, 0.25].map((d) => ({ lat: 30 + d, lon: -95 }));
+    const picked = spreadSelect([...dense, ...far], seed, 6);
+    expect(picked).toHaveLength(6);
+    expect(far.every((f) => picked.includes(f))).toBe(true);
+  });
+  it('returns everything when there are fewer than n, and never duplicates', () => {
+    const pts = [{ lat: 1, lon: 1 }, { lat: 2, lon: 2 }];
+    expect(spreadSelect(pts, pts[0], 5)).toEqual(pts);
+    const many = Array.from({ length: 20 }, (_, i) => ({ lat: i, lon: i }));
+    const picked = spreadSelect(many, many[0], 10);
+    expect(new Set(picked).size).toBe(10);
   });
 });

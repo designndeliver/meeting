@@ -40,7 +40,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       {
         // Cache key uses a coarse (~100 m) grid of the seed, never the addresses.
         pois: (seed, radiusKm) =>
-          cachedJson(`poi/${seed.lat.toFixed(3)}/${seed.lon.toFixed(3)}/${Math.round(radiusKm * 10)}`, 6 * 3600, async () =>
+          cachedJson(`poi-v2/${seed.lat.toFixed(3)}/${seed.lon.toFixed(3)}/${Math.round(radiusKm * 10)}`, 6 * 3600, async () =>
             parseOverpass(await fetchOverpass(buildQuery(seed, radiusKm * 1000)), seed),
           ),
         matrix: (m, o, d) => matrix(m, o, d, env.ORS_API_KEY),

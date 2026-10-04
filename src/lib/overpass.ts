@@ -23,7 +23,7 @@ export function buildQuery(seed: LatLon, radiusM: number, categories: readonly s
   const parts: string[] = [];
   if (amenities.length) parts.push(`nw["amenity"~"^(${amenities.join('|')})$"]["name"]${around};`);
   if (categories.includes('park')) parts.push(`nw["leisure"="park"]["name"]${around};`);
-  return `[out:json][timeout:25];(${parts.join('')});out center 300;`;
+  return `[out:json][timeout:25];(${parts.join('')});out center 800;`;
 }
 
 interface OverpassElement {
@@ -35,7 +35,7 @@ interface OverpassElement {
   tags?: Record<string, string | undefined>;
 }
 
-export function parseOverpass(json: { elements?: OverpassElement[] }, seed: LatLon, limit = 40): Poi[] {
+export function parseOverpass(json: { elements?: OverpassElement[] }, seed: LatLon, limit = 800): Poi[] {
   const pois: Poi[] = [];
   for (const el of json.elements ?? []) {
     const name = el.tags?.name;

@@ -59,7 +59,7 @@
         spread: number;
         equidistance: string;
       }
-      interface MeetOut { seed: { lat: number; lon: number }; radiusKm: number; widened: boolean; metric: 'duration' | 'distance'; results: Result[] }
+      interface MeetOut { seed: { lat: number; lon: number }; radiusKm: number; refined: boolean; metric: 'duration' | 'distance'; results: Result[] }
 
       const MAX_ADDRESSES = 3; // phase 1; the API already accepts up to 10
       const COLORS = ['#2563eb', '#db2777', '#059669', '#d97706', '#7c3aed', '#0891b2'];
@@ -136,6 +136,13 @@
       const fmtTime = (s: number) => {
         const m = Math.max(1, Math.round(s / 60));
         return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+      };
+      const fmtSpread = (r: Result, metric: 'duration' | 'distance') => {
+        if (metric === 'duration') {
+          const m = Math.round(r.spread / 60);
+          return m < 1 ? 'within a minute of each other' : `within ${m} min of each other`;
+        }
+        return r.spread < 160 ? 'within 100 m of each other' : `within ${fmtDist(r.spread)} of each other`;
       };
       const fmtDist = (m: number) => (miles ? `${(m / 1609.344).toFixed(1)} mi` : `${(m / 1000).toFixed(1)} km`);
 
@@ -237,7 +244,7 @@
         resultsEl.hidden = false;
         const by = out.metric === 'duration' ? 'travel time' : 'distance';
         noteEl.textContent = `Ranked so the person with the longest trip has the shortest one possible, by ${by}.` +
-          (out.widened ? ' The search area was widened to find a fairer spot.' : '');
+          (out.refined ? ' The search was refined around the first pick to find a fairer spot.' : '');
         if (!map) {
           map = L.map('map', { scrollWheelZoom: false });
           L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -251,7 +258,7 @@
           head.append(el('span', { class: 'rank' }, String(k + 1)), el('span', { class: 'name' }, r.poi.name),
             el('span', { class: 'cat' }, r.poi.category.replace('_', ' ')));
           head.addEventListener('click', () => select(out, origins, k));
-          const fair = el('p', { class: 'fair' }, r.equidistance);
+          const fair = el('p', { class: 'fair' }, fmtSpread(r, out.metric));
           const ul = el('ul', { class: 'legs' });
           r.legs.forEach((leg, i) => {
             const item = el('li');
